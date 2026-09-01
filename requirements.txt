@@ -1,0 +1,27 @@
+# --- API ---
+fastapi
+uvicorn[standard]
+pydantic
+pydantic-settings
+python-dotenv
+
+# --- LLM / RAG ---
+langchain
+langchain-core
+langchain-community
+langchain-ollama
+ollama
+
+# --- Vector stores ---
+# chromadb              # prototyping
+# langchain-chroma
+# qdrant-client         # production
+# langchain-qdrant
+
+# --- Ingestion ---
+# atlassian-python-api  # Confluence
+# slack-sdk             # Slack
+
+# --- UI / eval ---
+# streamlit
+# ragas
