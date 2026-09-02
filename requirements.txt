@@ -8,20 +8,21 @@ python-dotenv
 # --- LLM / RAG ---
 langchain
 langchain-core
-langchain-community
 langchain-ollama
 ollama
 
 # --- Vector stores ---
-# chromadb              # prototyping
-# langchain-chroma
+# chromadb 1.x needs langchain-chroma >=1.1; the older 0.2.x wrapper caps at <0.7
+chromadb>=1.5,<2
+langchain-chroma>=1.1
 # qdrant-client         # production
 # langchain-qdrant
 
 # --- Ingestion ---
-# atlassian-python-api  # Confluence
+atlassian-python-api    # Confluence
 # slack-sdk             # Slack
 
 # --- UI / eval ---
-# streamlit
+streamlit
+requests
 # ragas
