@@ -12,7 +12,7 @@ logger = get_logger(__name__)
 
 #: nomic-embed-text is trained with task prefixes; mismatching them between
 #: ingest and query silently degrades recall. Centralised here so no caller
-#: can get it wrong -- see docs/CONFLUENCE.md section 4.3.
+#: can get it wrong.
 DOCUMENT_PREFIX = "search_document: "
 QUERY_PREFIX = "search_query: "
 

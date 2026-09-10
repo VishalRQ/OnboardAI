@@ -1,8 +1,7 @@
 """Confluence storage format (XHTML + ac: macros) -> markdown-ish plain text.
 
 Headings become markdown so the chunker can split on them; tables and code
-blocks survive intact because chunking must not break them apart
-(docs/CONFLUENCE.md section 3.4).
+blocks survive intact because chunking must not break them apart.
 """
 
 import re

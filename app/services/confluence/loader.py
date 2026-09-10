@@ -3,9 +3,10 @@
 Real implementation uses atlassian-python-api against settings.confluence_url.
 Until credentials exist, `load_pages` serves local fixtures with the same
 shape as live pages so the rest of the pipeline can be built and tuned
-offline (docs/CONFLUENCE.md section 6).
+offline.
 """
 
+import time
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 
@@ -25,7 +26,8 @@ class RawDocument:
     metadata: dict = field(default_factory=dict)
 
 
-def _fixture(page_id, title, ancestors, labels, text, version=1, space="ENG"):
+def _fixture(page_id, title, ancestors, labels, text, version=1,
+             space="ENG", space_name="Engineering"):
     """Build a fixture page carrying the metadata a live page would have."""
     return RawDocument(
         id=f"confluence:{page_id}",
@@ -35,7 +37,7 @@ def _fixture(page_id, title, ancestors, labels, text, version=1, space="ENG"):
             "source": "confluence",
             "page_id": str(page_id),
             "space_key": space,
-            "space_name": "Engineering",
+            "space_name": space_name,
             "version": version,
             "ancestors": ancestors,
             "labels": f"|{'|'.join(labels)}|" if labels else "",
@@ -88,7 +90,7 @@ ninety seconds to propagate.""",
     ),
     _fixture(
         123458, "Requesting Time Off", "Handbook > People",
-        ["leave", "policy"], version=3,
+        ["leave", "policy"], version=3, space="HR", space_name="People Ops",
         text="""# How to request leave
 Submit the request in the HR portal at least two weeks in advance for planned
 leave. Your manager approves it there; no email is required.
@@ -135,22 +137,98 @@ def _to_document(page: dict, base_url: str) -> RawDocument:
     )
 
 
-async def load_pages(
+def has_credentials() -> bool:
+    """Whether a live Confluence is reachable, as opposed to fixture mode."""
+    settings = get_settings()
+    return bool(settings.confluence_url and settings.confluence_api_token)
+
+
+def configured_spaces() -> list[str]:
+    return list(get_settings().confluence_space_keys)
+
+
+#: (expires_at, spaces) for the live space list. The UI re-asks on every
+#: Streamlit rerun -- that is a widget click paginating a remote API -- and
+#: spaces are created about weekly, so a short TTL costs nothing in freshness.
+_SPACE_CACHE: tuple[float, list[dict]] | None = None
+
+
+def invalidate_space_cache() -> None:
+    """Drop the cached space list. Called after an ingest, which is the one
+    moment a caller has a reason to expect the list to have changed."""
+    global _SPACE_CACHE
+    _SPACE_CACHE = None
+
+
+def list_spaces() -> list[dict]:
+    """Spaces available to pick from: `{key, name}`, deduped and sorted.
+
+    Live credentials give the real list. Without them the fixtures decide,
+    so the picker still works offline instead of rendering an empty dropdown.
+    """
+    global _SPACE_CACHE
+    if not has_credentials():
+        seen = {
+            page.metadata["space_key"]: page.metadata.get("space_name", "")
+            for page in FIXTURES
+        }
+        return [{"key": key, "name": name} for key, name in sorted(seen.items())]
+
+    if _SPACE_CACHE and _SPACE_CACHE[0] > time.monotonic():
+        return _SPACE_CACHE[1]
+
+    spaces = [
+        {"key": space.get("key", ""), "name": space.get("name", "")}
+        for space in ConfluenceClient().list_spaces()
+        if space.get("key")
+    ]
+    # a space listed in .env but invisible to the token is worth showing as a
+    # choice: ingesting it produces the "check the space KEY" warning, which
+    # says far more than the key silently missing from the dropdown
+    known = {space["key"] for space in spaces}
+    spaces.extend({"key": key, "name": ""} for key in configured_spaces() if key not in known)
+    spaces = sorted(spaces, key=lambda space: space["key"])
+    ttl = get_settings().confluence_space_cache_seconds
+    _SPACE_CACHE = (time.monotonic() + ttl, spaces)
+    return spaces
+
+
+def load_page_ids(space_keys: list[str]) -> set[str] | None:
+    """Current page ids across `space_keys`, or None when in fixture mode.
+
+    None rather than an empty set on purpose: reconciliation must not read
+    "the source has no pages" and purge the whole index.
+    """
+    if not has_credentials():
+        return None
+    client = ConfluenceClient()
+    ids: set[str] = set()
+    for space_key in space_keys:
+        ids |= client.list_page_ids(space_key)
+    return ids
+
+
+def load_pages(
     space_keys: list[str] | None = None, since: str | None = None
 ) -> list[RawDocument]:
     """Fetch pages from Confluence. Serves fixtures when no credentials exist.
 
     `since` limits the query to pages modified on or after that date, which is
-    what makes the scheduled sync cheap (docs/CONFLUENCE.md section 7).
+    what makes the scheduled sync cheap.
     """
     settings = get_settings()
     spaces = space_keys or settings.confluence_space_keys
 
-    if not settings.confluence_url or not settings.confluence_api_token:
+    if not has_credentials():
+        # honour the space filter here too, or the picker looks broken offline
+        selected = [
+            page for page in FIXTURES
+            if not spaces or page.metadata["space_key"] in spaces
+        ]
         logger.warning(
-            "No Confluence credentials configured; serving %d fixture pages", len(FIXTURES)
+            "No Confluence credentials configured; serving %d fixture pages", len(selected)
         )
-        return list(FIXTURES)
+        return selected
 
     if not spaces:
         raise ValueError("CONFLUENCE_SPACE_KEYS is empty; nothing to load")

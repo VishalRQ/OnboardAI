@@ -63,33 +63,59 @@ class ConfluenceClient:
             return response.json()
         raise RuntimeError(f"Confluence still failing after {MAX_RETRIES} attempts: {url}")
 
-    def list_spaces(self, limit: int = 50) -> list[dict]:
-        """Spaces visible to this account. Used to verify access."""
-        data = self._get("/rest/api/space", {"limit": limit})
-        return data.get("results", [])
+    def _paginate(self, path: str, params: dict, label: str) -> list[dict]:
+        """Walk every page of a paged Confluence collection."""
+        results: list[dict] = []
+        start = 0
+        while True:
+            data = self._get(path, {**params, "limit": PAGE_LIMIT, "start": start})
+            batch = data.get("results", [])
+            results.extend(batch)
+            if len(batch) < PAGE_LIMIT:
+                break
+            start += PAGE_LIMIT
+            logger.info("Fetched %d %s so far", len(results), label)
+        return results
+
+    def list_spaces(self, space_type: str = "global") -> list[dict]:
+        """Spaces visible to this account, for the space picker.
+
+        Defaults to `global`: personal spaces (~accountid) are every user's
+        own scratch area and only clutter a list meant for team knowledge.
+        """
+        params = {"type": space_type} if space_type else {}
+        return self._paginate("/rest/api/space", params, "spaces")
+
+    @staticmethod
+    def _page_cql(space_key: str, since: str | None) -> str:
+        cql = f'space = "{space_key}" AND type = page'
+        if since:
+            cql += f' AND lastmodified >= "{since}"'
+        return cql + " ORDER BY lastmodified DESC"
 
     def search_pages(self, space_key: str, since: str | None = None) -> list[dict]:
         """Pages in `space_key`, optionally only those modified since `since`.
 
         `since` is a Confluence date string (YYYY-MM-DD or 'YYYY-MM-DD HH:MM').
         """
-        cql = f'space = "{space_key}" AND type = page'
-        if since:
-            cql += f' AND lastmodified >= "{since}"'
-        cql += " ORDER BY lastmodified DESC"
+        return self._paginate(
+            "/rest/api/content/search",
+            {"cql": self._page_cql(space_key, since), "expand": EXPAND},
+            f"pages from {space_key}",
+        )
 
-        results, start = [], 0
-        while True:
-            data = self._get("/rest/api/content/search",
-                             {"cql": cql, "limit": PAGE_LIMIT, "start": start,
-                              "expand": EXPAND})
-            batch = data.get("results", [])
-            results.extend(batch)
-            if len(batch) < PAGE_LIMIT:
-                break
-            start += PAGE_LIMIT
-            logger.info("Fetched %d pages from %s so far", len(results), space_key)
-        return results
+    def list_page_ids(self, space_key: str) -> set[str]:
+        """Every current page id in `space_key`, with no body expansion.
+
+        Deletion reconciliation only needs identity, and skipping `expand`
+        keeps the daily sweep to a fraction of an ingest's cost.
+        """
+        pages = self._paginate(
+            "/rest/api/content/search",
+            {"cql": self._page_cql(space_key, None)},
+            f"page ids from {space_key}",
+        )
+        return {str(page["id"]) for page in pages if page.get("id")}
 
     def whoami(self) -> dict:
         """Current user; the cheapest call that proves the credentials work."""

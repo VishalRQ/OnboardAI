@@ -21,5 +21,7 @@ async def health() -> dict:
         "app": settings.app_name,
         "vector_backend": settings.vector_backend,
         "llm_model": settings.llm_model,
+        # the UI shows retrieval depth rather than offering it as a control
+        "top_k": settings.top_k,
         "ollama": ollama,
     }
