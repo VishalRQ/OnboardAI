@@ -6,3 +6,7 @@ data/
 .pytest_cache/
 .DS_Store
 *.pyc
+# documentation & notes are kept local, never committed
+docs/
+*.md
+!README.md

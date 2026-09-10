@@ -38,7 +38,18 @@ class Settings(BaseSettings):
 
     # Slack
     slack_bot_token: str | None = None
+    #: workspace export .zip or unzipped dir; used when no bot token is set
     slack_export_path: str | None = None
+    #: channels to ingest, by name (without #) or id. Empty = every public
+    #: channel the bot is a member of.
+    slack_channels: list[str] = Field(default_factory=list)
+    #: seconds to wait between Slack API calls. New, non-Marketplace apps are
+    #: throttled to ~1 conversations.history call/minute (2025 change) -- set
+    #: this to 60 for such an app. 0 is fine for an older or approved app.
+    slack_min_request_interval: float = 0.0
+    #: index private channels / group DMs the bot is in. Off by default: they
+    #: hold sensitive content and are out of scope for onboarding Q&A.
+    slack_index_private: bool = False
 
 
 @lru_cache
