@@ -8,7 +8,6 @@ from app.core.logging import get_logger
 from app.schemas.chat import ChatRequest, ChatResponse, MultiChatRequest, SourceDocument
 from app.services.common.base import BaseRAGService, resolve_top_k
 from app.services.confluence import get_confluence_service
-from app.services.slack import get_slack_service
 
 logger = get_logger(__name__)
 
@@ -18,7 +17,6 @@ router = APIRouter(prefix="/chat", tags=["chat"])
 def _registry() -> dict[str, BaseRAGService]:
     return {
         "confluence": get_confluence_service(),
-        "slack": get_slack_service(),
     }
 
 
@@ -38,8 +36,8 @@ async def _retrieve(
 def _interleave(results: list[list[SourceDocument]], limit: int) -> list[SourceDocument]:
     """Fuse per-source hit lists by taking rank 1 from each, then rank 2, ...
 
-    Deliberately not a sort by score: each source has its own collection and,
-    for Slack, no score at all, so the numbers are not comparable across
+    Deliberately not a sort by score: each source has its own collection, and
+    some report no score at all, so the numbers are not comparable across
     sources. Rank is, and round-robin also guarantees every selected source
     gets a say instead of one of them filling the whole context.
 

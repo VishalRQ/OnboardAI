@@ -23,7 +23,7 @@ async def lifespan(app: FastAPI):
 
 app = FastAPI(
     title=settings.app_name,
-    description="RAG backend over internal onboarding knowledge (Confluence, Slack).",
+    description="RAG backend over internal onboarding knowledge (Confluence).",
     version="0.1.0",
     lifespan=lifespan,
 )

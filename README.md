@@ -5,8 +5,8 @@ RAG backend over internal onboarding knowledge. Each knowledge source
 
 Current state: **Confluence works end to end** — live CQL ingestion, chunking,
 Ollama embeddings, Chroma retrieval and grounded answers, with incremental
-sync and deletion reconciliation. Slack is still a stub loader behind the same
-contract. A Streamlit UI (`streamlit_app.py`) drives the whole thing.
+sync and deletion reconciliation. A Streamlit UI (`streamlit_app.py`) drives
+the whole thing. Slack is a separate branch and is not wired up here.
 
 ## Layout
 
@@ -23,22 +23,18 @@ app/
 │   ├── __init__.py          aggregates every router
 │   ├── health.py
 │   ├── chat.py              source-agnostic: /api/chat/{source}
-│   ├── confluence.py
-│   └── slack.py
+│   └── confluence.py
 └── services/
     ├── llm_service.py       shared Ollama LLM + embeddings
     ├── common/
     │   ├── base.py          BaseRAGService — the per-service contract
     │   ├── chunking.py      heading-aware splitting, shared by every source
     │   └── vectorstore.py   Chroma (proto) / Qdrant (prod) factory
-    ├── confluence/
-    │   ├── client.py        Confluence Cloud REST (CQL, pagination, backoff)
-    │   ├── html_to_text.py  storage-format XHTML → markdown-ish text
-    │   ├── loader.py        spaces → pages → RawDocument
-    │   ├── sync_state.py    watermark + run lock for incremental sync
-    │   └── service.py
-    └── slack/
-        ├── loader.py        export reader now, slack-sdk sync later
+    └── confluence/
+        ├── client.py        Confluence Cloud REST (CQL, pagination, backoff)
+        ├── html_to_text.py  storage-format XHTML → markdown-ish text
+        ├── loader.py        spaces → pages → RawDocument
+        ├── sync_state.py    watermark + run lock for incremental sync
         └── service.py
 ```
 
@@ -66,8 +62,6 @@ Docs at http://localhost:8000/docs
 | GET    | `/api/confluence/chunks`  | page through the index           |
 | POST   | `/api/confluence/ingest`  | index Confluence spaces          |
 | POST   | `/api/confluence/chat`    | chat over Confluence             |
-| POST   | `/api/slack/ingest`       | index Slack export / incremental |
-| POST   | `/api/slack/chat`         | chat over Slack                  |
 
 ```bash
 # one source, restricted to two spaces
@@ -75,10 +69,10 @@ curl -X POST localhost:8000/api/confluence/chat \
   -H 'content-type: application/json' \
   -d '{"question":"How do I get laptop access?","space_keys":["ENG"]}'
 
-# every selected source at once
+# every selected source at once (Confluence alone, until a second one lands)
 curl -X POST localhost:8000/api/chat \
   -H 'content-type: application/json' \
-  -d '{"question":"How do I get laptop access?","sources":["confluence","slack"]}'
+  -d '{"question":"How do I get laptop access?","sources":["confluence"]}'
 ```
 
 Retrieval depth is `TOP_K` in `.env`, not a request field: it trades answer
@@ -94,11 +88,11 @@ whose version is already indexed, and about daily diffs the full page-id list
 to purge pages deleted at the source. `{"full_refresh": true}` re-reads
 everything. A run holds a lock file; a second concurrent run gets a `409`.
 
-## Adding a third service
+## Adding a second service
 
 1. `app/services/<name>/` with `loader.py` + `service.py`; subclass
    `BaseRAGService` and set `name` / `collection`.
-2. `app/api/routes/<name>.py` — copy `slack.py`, swap the dependency.
+2. `app/api/routes/<name>.py` — copy `confluence.py`, swap the dependency.
 3. Register the router in `app/api/routes/__init__.py` and add the service to
    the registry in `app/api/routes/chat.py`.
 
@@ -109,13 +103,14 @@ streamlit run streamlit_app.py     # alongside uvicorn
 ```
 
 It reads the same `.env` as the backend; point it at another host with
-`ONBOARDAI_API_URL`. Pick sources (Confluence, Slack, or both), narrow to
-specific Confluence spaces from a dropdown, and run ingestion. Answers cite one
-line per source document — name, space and link, no excerpt.
+`ONBOARDAI_API_URL`. The source picker is filled from `/api/chat/sources`, so
+it lists whatever the backend registers. Narrow to specific Confluence spaces
+from a dropdown, and run ingestion. Answers cite one line per source document —
+name, space and link, no excerpt.
 
 ## Next steps
 
-- Real Slack export parser (owned separately).
+- Merge the Slack service (owned separately, `develop/slack`).
 - Qdrant backend behind the existing `get_vectorstore` seam.
 - Contextual Retrieval (context-augmented chunks, hybrid search, rank fusion)
   in `common/` so both services get it.

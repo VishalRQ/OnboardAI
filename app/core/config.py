@@ -55,9 +55,6 @@ class Settings(BaseSettings):
     #: a checkbox click from paginating a remote API.
     confluence_space_cache_seconds: int = 300
 
-    # Slack
-    slack_bot_token: str | None = None
-    slack_export_path: str | None = None
 
 
 @lru_cache

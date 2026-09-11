@@ -20,7 +20,6 @@ langchain-chroma>=1.1
 
 # --- Ingestion ---
 atlassian-python-api    # Confluence
-# slack-sdk             # Slack
 
 # --- UI / eval ---
 streamlit
