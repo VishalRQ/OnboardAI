@@ -14,7 +14,12 @@ from app.schemas.chat import SourceDocument
 from app.schemas.ingest import IngestRequest, IngestResponse
 from app.services.common.base import BaseRAGService
 from app.services.common.chunking import chunk_document
-from app.services.common.vectorstore import count, delete_by_metadata, get_vectorstore
+from app.services.common.vectorstore import (
+    count,
+    delete_by_metadata,
+    get_vectorstore,
+    group_by,
+)
 from app.services.slack.loader import RawThread, load_threads, now_iso
 
 logger = get_logger(__name__)
@@ -157,6 +162,39 @@ class SlackService(BaseRAGService):
                 metadata={k: v for k, v in doc.metadata.items() if k != "raw_text"},
             )
             for doc, score in kept
+        ]
+
+    def channels(self) -> list[dict]:
+        """Channels the UI can offer, each with its indexed chunk count.
+
+        Mirrors ConfluenceService.spaces(). Typing channel names by hand is the
+        same trap as typing space keys: a name the bot cannot see fails the
+        whole ingest, so the picker should only ever offer real options.
+
+        `resolve_channels([])` returns everything the bot can see, which is the
+        only sensible candidate list -- a channel it is not in cannot be read.
+        """
+        from app.services.slack.client import SlackClient
+
+        # chunk metadata stores the display form ("#general"); the API returns
+        # the bare name, so compare on the stripped form
+        indexed = {k.lstrip("#"): v for k, v in group_by(self.collection, "channel").items()}
+        # members_only=False so the picker can show unjoined channels as
+        # needing an invite rather than hiding them and looking broken
+        available = SlackClient().resolve_channels(
+            [], include_private=get_settings().slack_index_private, members_only=False
+        )
+        known = {c["name"] for c in available}
+        # a channel that was indexed and later left is still answerable, so it
+        # belongs in the picker even though the bot can no longer read it
+        available += [
+            {"id": "", "name": name, "is_private": False, "is_member": False}
+            for name in indexed
+            if name not in known
+        ]
+        return [
+            {**c, "indexed_chunks": indexed.get(c["name"], 0)}
+            for c in sorted(available, key=lambda c: c["name"])
         ]
 
 

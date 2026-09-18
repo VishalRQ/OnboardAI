@@ -107,16 +107,31 @@ class SlackClient:
             )
         return out
 
-    def resolve_channels(self, wanted: list[str], include_private: bool) -> list[dict]:
-        """Map channel names/ids to `{id, name}`. Empty `wanted` = all the bot is in."""
+    def resolve_channels(
+        self, wanted: list[str], include_private: bool, members_only: bool = True
+    ) -> list[dict]:
+        """Map channel names/ids to `{id, name, is_private, is_member}`.
+
+        Empty `wanted` = every channel the bot is in. conversations.list
+        returns every *visible* channel, joined or not, but reading one the
+        bot has not joined fails with `not_in_channel` -- and that kills the
+        whole ingest, not just the channel. So membership is filtered here,
+        where the promise is made, rather than left to blow up at history.
+
+        `members_only=False` keeps the unjoined ones, for a picker that wants
+        to show them as needing an invite.
+        """
         types = "public_channel,private_channel" if include_private else "public_channel"
         wanted_set = {w.lstrip("#") for w in wanted}
         found: list[dict] = []
         for ch in self._paginate("conversations.list", "channels",
                                  types=types, exclude_archived=True):
+            if members_only and not ch.get("is_member", False):
+                continue
             if not wanted_set or ch["id"] in wanted_set or ch["name"] in wanted_set:
                 found.append({"id": ch["id"], "name": ch["name"],
-                              "is_private": ch.get("is_private", False)})
+                              "is_private": ch.get("is_private", False),
+                              "is_member": ch.get("is_member", False)})
         missing = wanted_set - {c["id"] for c in found} - {c["name"] for c in found}
         if missing:
             logger.warning("Slack: requested channels not found or bot not a member: %s",
