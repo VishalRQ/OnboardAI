@@ -77,14 +77,22 @@ class ConfluenceClient:
             logger.info("Fetched %d %s so far", len(results), label)
         return results
 
-    def list_spaces(self, space_type: str = "global") -> list[dict]:
+    def list_spaces(self, include_personal: bool = False) -> list[dict]:
         """Spaces visible to this account, for the space picker.
 
-        Defaults to `global`: personal spaces (~accountid) are every user's
-        own scratch area and only clutter a list meant for team knowledge.
+        Excludes personal spaces (~accountid): every user's own scratch area,
+        which only clutters a list meant for team knowledge.
+
+        Deliberately filters by exclusion rather than asking the API for
+        type="global". Confluence has more team space types than that -- a
+        knowledge base is type "knowledge_base" -- so requesting global alone
+        silently hides real spaces from the picker, which then looks like the
+        space does not exist rather than like a filter.
         """
-        params = {"type": space_type} if space_type else {}
-        return self._paginate("/rest/api/space", params, "spaces")
+        spaces = self._paginate("/rest/api/space", {}, "spaces")
+        if include_personal:
+            return spaces
+        return [space for space in spaces if space.get("type") != "personal"]
 
     @staticmethod
     def _page_cql(space_key: str, since: str | None) -> str:

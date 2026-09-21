@@ -59,6 +59,15 @@ def error_detail(exc: requests.RequestException) -> str:
                 str(item.get("msg", item)) if isinstance(item, dict) else str(item)
                 for item in detail
             ) or str(exc)
+        # An unhandled exception in the backend: FastAPI returns the bare string
+        # "Internal Server Error" with no JSON body, so there is nothing here
+        # written for a reader. Say where the real message is instead of
+        # forwarding a URL and a status code that explain nothing.
+        if response.status_code >= 500:
+            return (
+                f"the backend raised an unhandled error ({response.status_code}). "
+                "The traceback is in the uvicorn console, not here."
+            )
     return str(exc)
 
 
