@@ -3,10 +3,13 @@
 RAG backend over internal onboarding knowledge. Each knowledge source
 (Confluence, Slack, ...) is its own service package behind a shared contract.
 
-Current state: **Confluence works end to end** — live CQL ingestion, chunking,
-Ollama embeddings, Chroma retrieval and grounded answers, with incremental
-sync and deletion reconciliation. A Streamlit UI (`streamlit_app.py`) drives
-the whole thing. Slack is a separate branch and is not wired up here.
+Current state: **Confluence and Slack both work end to end** — live ingestion,
+chunking, Ollama embeddings, Chroma retrieval and grounded answers. Both skip
+re-indexing anything unchanged; only Confluence has a fetch-side watermark
+(asks the source for just what changed) and a retrieval-time space filter —
+Slack still re-fetches everything from the API each run and doesn't filter by
+channel at query time yet. A Streamlit UI (`streamlit_app.py`) drives
+Confluence today.
 
 ## Layout
 
@@ -22,19 +25,25 @@ app/
 ├── api/routes/
 │   ├── __init__.py          aggregates every router
 │   ├── health.py
-│   ├── chat.py              source-agnostic: /api/chat/{source}
-│   └── confluence.py
+│   ├── chat.py              source-agnostic: /api/chat/{source}, /api/chat fan-out
+│   ├── confluence.py
+│   └── slack.py
 └── services/
     ├── llm_service.py       shared Ollama LLM + embeddings
     ├── common/
     │   ├── base.py          BaseRAGService — the per-service contract
     │   ├── chunking.py      heading-aware splitting, shared by every source
     │   └── vectorstore.py   Chroma (proto) / Qdrant (prod) factory
-    └── confluence/
-        ├── client.py        Confluence Cloud REST (CQL, pagination, backoff)
-        ├── html_to_text.py  storage-format XHTML → markdown-ish text
-        ├── loader.py        spaces → pages → RawDocument
-        ├── sync_state.py    watermark + run lock for incremental sync
+    ├── confluence/
+    │   ├── client.py        Confluence Cloud REST (CQL, pagination, backoff)
+    │   ├── html_to_text.py  storage-format XHTML → markdown-ish text
+    │   ├── loader.py        spaces → pages → RawDocument
+    │   ├── sync_state.py    watermark + run lock for incremental sync
+    │   └── service.py
+    └── slack/
+        ├── client.py        Slack Web API (rate-limit backoff, cursor paging)
+        ├── normalize.py     raw message → clean text + edit marker
+        ├── loader.py        Web API / export / fixtures → thread & window units
         └── service.py
 ```
 
@@ -62,6 +71,9 @@ Docs at http://localhost:8000/docs
 | GET    | `/api/confluence/chunks`  | page through the index           |
 | POST   | `/api/confluence/ingest`  | index Confluence spaces          |
 | POST   | `/api/confluence/chat`    | chat over Confluence             |
+| GET    | `/api/slack/chunks`       | page through the index           |
+| POST   | `/api/slack/ingest`       | index Slack channels             |
+| POST   | `/api/slack/chat`         | chat over Slack                  |
 
 ```bash
 # one source, restricted to two spaces
@@ -69,10 +81,10 @@ curl -X POST localhost:8000/api/confluence/chat \
   -H 'content-type: application/json' \
   -d '{"question":"How do I get laptop access?","space_keys":["ENG"]}'
 
-# every selected source at once (Confluence alone, until a second one lands)
+# every selected source at once
 curl -X POST localhost:8000/api/chat \
   -H 'content-type: application/json' \
-  -d '{"question":"How do I get laptop access?","sources":["confluence"]}'
+  -d '{"question":"How do I get laptop access?","sources":["confluence","slack"]}'
 ```
 
 Retrieval depth is `TOP_K` in `.env`, not a request field: it trades answer
@@ -88,7 +100,16 @@ whose version is already indexed, and about daily diffs the full page-id list
 to purge pages deleted at the source. `{"full_refresh": true}` re-reads
 everything. A run holds a lock file; a second concurrent run gets a `409`.
 
-## Adding a second service
+`POST /api/slack/ingest` fetches the requested channels (or every public
+channel the bot is in) each run, groups messages into threads and topic-sized
+windows, and skips re-chunking any unit whose newest message timestamp is
+unchanged. `{"full_refresh": true}` also reconciles deletions for the covered
+channels. It does not yet have Confluence's fetch-side watermark, so a run
+still re-reads the channel's full history from Slack every time — cheap for
+a small channel, a Slack rate-limit concern for a busy one (see
+`SLACK_MIN_REQUEST_INTERVAL`).
+
+## Adding a third service
 
 1. `app/services/<name>/` with `loader.py` + `service.py`; subclass
    `BaseRAGService` and set `name` / `collection`.
@@ -110,7 +131,11 @@ name, space and link, no excerpt.
 
 ## Next steps
 
-- Merge the Slack service (owned separately, `develop/slack`).
+- Slack: a `sync_state.py`-style per-channel watermark (mirroring Confluence's),
+  and a `channels` retrieval filter (`supports_space_filter` equivalent).
+- Cross-source **project** scoping: tag chunks from both sources with a
+  `project` field (from a small source → project mapping) so a question can
+  be scoped to one project's data instead of everything indexed.
 - Qdrant backend behind the existing `get_vectorstore` seam.
 - Contextual Retrieval (context-augmented chunks, hybrid search, rank fusion)
   in `common/` so both services get it.

@@ -8,6 +8,7 @@ from app.core.logging import get_logger
 from app.schemas.chat import ChatRequest, ChatResponse, MultiChatRequest, SourceDocument
 from app.services.common.base import BaseRAGService, resolve_top_k
 from app.services.confluence import get_confluence_service
+from app.services.slack import get_slack_service
 
 logger = get_logger(__name__)
 
@@ -17,6 +18,7 @@ router = APIRouter(prefix="/chat", tags=["chat"])
 def _registry() -> dict[str, BaseRAGService]:
     return {
         "confluence": get_confluence_service(),
+        "slack": get_slack_service(),
     }
 
 
