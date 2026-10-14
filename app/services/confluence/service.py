@@ -6,9 +6,9 @@ from functools import lru_cache
 
 from app.core.config import get_settings
 from app.core.logging import get_logger
-from app.schemas.chat import ChatRequest, ChatResponse, SourceDocument
+from app.schemas.chat import SourceDocument
 from app.schemas.ingest import IngestRequest, IngestResponse
-from app.services.common.base import BaseRAGService, resolve_top_k
+from app.services.common.base import BaseRAGService
 from app.services.common.chunking import chunk_document
 from app.services.common.vectorstore import (
     count,
@@ -248,14 +248,6 @@ class ConfluenceService(BaseRAGService):
             )
             for doc, score in kept
         ]
-
-    async def chat(self, request: ChatRequest) -> ChatResponse:
-        sources = await self.retrieve(
-            request.question,
-            resolve_top_k(request.top_k),
-            space_keys=request.space_keys,
-        )
-        return await self.respond(request.question, sources)
 
     def spaces(self) -> list[dict]:
         """Selectable spaces, annotated with what is currently indexed."""

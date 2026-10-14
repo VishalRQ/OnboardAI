@@ -28,6 +28,8 @@ class BaseRAGService(ABC):
     #: cross-source fan-out pass a space filter only where it means something,
     #: without every source having to grow the argument.
     supports_space_filter: bool = False
+    #: True when `retrieve` accepts a `channels=` keyword. Same idea, for Slack.
+    supports_channel_filter: bool = False
 
     @abstractmethod
     async def ingest(self, request: IngestRequest) -> IngestResponse:
@@ -42,7 +44,19 @@ class BaseRAGService(ABC):
         answer = await generate_answer(question, [s.text for s in sources])
         return ChatResponse(answer=answer, source=self.name, sources=sources)
 
+    def filters(self, request: ChatRequest) -> dict:
+        """The request's narrowing that this source understands, as
+        `retrieve` keywords -- so a space filter never reaches Slack."""
+        kwargs = {}
+        if self.supports_space_filter:
+            kwargs["space_keys"] = request.space_keys
+        if self.supports_channel_filter:
+            kwargs["channels"] = request.channels
+        return kwargs
+
     async def chat(self, request: ChatRequest) -> ChatResponse:
         """Retrieve, then generate. Override only if the flow differs."""
-        sources = await self.retrieve(request.question, resolve_top_k(request.top_k))
+        sources = await self.retrieve(
+            request.question, resolve_top_k(request.top_k), **self.filters(request)
+        )
         return await self.respond(request.question, sources)

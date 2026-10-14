@@ -51,14 +51,13 @@ streamlit run streamlit_app.py
 
 ## Using the app
 
-1. **Search in:** pick Confluence, Slack, or both. Optionally pick Confluence
-   spaces to search only those.
-2. **Update index:** tick the sources to refresh and press **Update**.
-   - Confluence updates the spaces you picked, or every space if none are
-     picked.
-   - Slack updates every channel the bot has been invited to
-     (`/invite @<bot>` in the channel). It is rate-limited and can take a
-     few minutes.
+1. **Search in:** pick Confluence, Slack, or both. Optionally narrow the
+   search to some Confluence spaces or Slack channels.
+2. **Update index:** tick the sources to refresh, optionally pick which
+   spaces or channels (blank = all), and press **Update**.
+   - Slack only offers channels the bot has been invited to
+     (`/invite @<bot>` in the channel). It is rate-limited, so picking just
+     the channels that changed is much faster than updating all of them.
    - Updates run in the background: keep chatting, and a popup says when
      each source is done.
    - Updates only fetch what changed. Tick **Full refresh** to re-index

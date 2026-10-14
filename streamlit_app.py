@@ -453,6 +453,39 @@ with st.sidebar:
         elif online:
             st.caption("No Confluence spaces visible yet — run an ingest.")
 
+    # --- channels --------------------------------------------------------
+    # Same picker for Slack, listed live from the workspace. Only channels the
+    # bot is in: those are the ones it can read, so the only ones an update
+    # can refresh -- anything else in the list would be a dead end.
+    channels: list[dict] = []
+    if online and "slack" in available:
+        try:
+            channels = fetch_channels(API_URL)
+        except requests.RequestException as exc:
+            st.warning(f"Could not list Slack channels: {error_detail(exc)}")
+    joined = {c["name"] for c in channels if c.get("id") and c.get("is_member")}
+
+    def channel_label(name: str) -> str:
+        ch = next((c for c in channels if c["name"] == name), {})
+        indexed = ch.get("indexed_chunks", 0)
+        text = f"#{name}" + (" \N{LOCK}" if ch.get("is_private") else "")
+        return text + (f" ({indexed} chunks)" if indexed else " (not indexed)")
+
+    slack_channels: list[str] = []
+    if "slack" in selected_sources:
+        if joined:
+            slack_channels = st.multiselect(
+                "Slack channels",
+                sorted(joined),
+                format_func=channel_label,
+                placeholder="All channels",
+                key="slack_channels",
+                help="Blank searches every indexed channel and updates every "
+                     "channel the bot is in. `/invite` the bot to add one.",
+            )
+        elif online:
+            st.caption("The bot is in no Slack channel. `/invite` it to one to index it.")
+
     # --- update ------------------------------------------------------------
     # Which sources to re-index is its own choice, not "Search in": a reader
     # may search both while only Confluence needs refreshing, and Slack costs
@@ -477,32 +510,38 @@ with st.sidebar:
                 )
             ]
 
+        # Each ticked source gets its own picker for what to refresh, separate
+        # from what to search: with hundreds of spaces or channels "update
+        # everything" is slow (Slack runs about a call a minute), and the
+        # handful that changed are rarely the ones being searched. Blank
+        # still means all.
         plan: dict[str, dict] = {}
-        scope: list[str] = []
         if "confluence" in update_sources:
-            # the space picker only exists while Confluence is searched; when
-            # it is hidden there is no narrowing, so the update covers all
-            picked = space_keys if "confluence" in selected_sources else []
-            plan["confluence"] = {"space_keys": picked} if picked else {}
-            scope.append(
-                f"Confluence: {', '.join(picked)}" if picked else "Confluence: all spaces"
+            picked = st.multiselect(
+                "Spaces to update",
+                [s["key"] for s in spaces],
+                format_func=space_label,
+                placeholder="All spaces",
+                key="update_space_keys",
+                help="Blank updates every space in Confluence.",
             )
+            plan["confluence"] = {"space_keys": picked} if picked else {}
         if "slack" in update_sources:
-            try:
-                joined = [
-                    c["name"] for c in fetch_channels(API_URL)
-                    if c.get("id") and c.get("is_member")
-                ]
-            except requests.RequestException as exc:
-                joined = []
-                st.warning(f"Could not list Slack channels: {error_detail(exc)}")
             if joined:
-                plan["slack"] = {"channels": joined}
-                scope.append("Slack: " + ", ".join(f"#{name}" for name in joined))
+                picked = st.multiselect(
+                    "Channels to update",
+                    sorted(joined),
+                    format_func=channel_label,
+                    placeholder="All channels",
+                    key="update_channels",
+                    help="Blank updates every channel the bot is in.",
+                )
+                # no list sent for "all": the backend resolves the bot's
+                # channels itself, and a full refresh then reconciles the
+                # whole collection, dropping channels the bot has left
+                plan["slack"] = {"channels": picked} if picked else {}
             else:
-                scope.append("Slack: the bot is in no channel; `/invite` it to one")
-        if scope:
-            st.caption(" · ".join(scope))
+                st.caption("Slack: the bot is in no channel. `/invite` it to one.")
 
         full_refresh = st.checkbox(
             "Full refresh",
@@ -591,6 +630,7 @@ def ask_page() -> None:
                         "question": question,
                         "sources": selected_sources,
                         "space_keys": space_keys,
+                        "channels": slack_channels,
                     },
                     CHAT_TIMEOUT,
                 )

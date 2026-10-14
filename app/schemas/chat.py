@@ -22,6 +22,9 @@ class ChatRequest(BaseModel):
     #: Confluence spaces to restrict retrieval to. Empty means every space.
     #: Ignored by sources that do not have spaces.
     space_keys: list[str] = Field(default_factory=list)
+    #: Slack channels (names, '#' optional) to restrict retrieval to. Empty
+    #: means every channel. Ignored by sources that do not have channels.
+    channels: list[str] = Field(default_factory=list)
 
 
 class MultiChatRequest(ChatRequest):

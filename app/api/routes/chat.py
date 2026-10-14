@@ -15,13 +15,10 @@ router = APIRouter(prefix="/chat", tags=["chat"])
 
 
 async def _retrieve(
-    service: BaseRAGService, question: str, top_k: int, space_keys: list[str]
+    service: BaseRAGService, request: ChatRequest, top_k: int
 ) -> list[SourceDocument]:
     """Retrieve from one source, tagging each chunk with where it came from."""
-    if service.supports_space_filter:
-        docs = await service.retrieve(question, top_k, space_keys=space_keys)
-    else:
-        docs = await service.retrieve(question, top_k)
+    docs = await service.retrieve(request.question, top_k, **service.filters(request))
     for doc in docs:
         doc.metadata.setdefault("source", service.name)
     return docs
@@ -67,7 +64,7 @@ async def multi_chat(request: MultiChatRequest) -> ChatResponse:
     top_k = resolve_top_k(request.top_k)
     services = [registry[name] for name in names]
     results = await asyncio.gather(
-        *(_retrieve(s, request.question, top_k, request.space_keys) for s in services),
+        *(_retrieve(s, request, top_k) for s in services),
         return_exceptions=True,
     )
 

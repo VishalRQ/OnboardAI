@@ -34,6 +34,7 @@ class SlackIngestInProgress(RuntimeError):
 class SlackService(BaseRAGService):
     name = "slack"
     collection = "slack_messages"
+    supports_channel_filter = True
 
     def _chunk(self, unit: RawThread, ingested_at: str):
         """One thread/window -> indexable chunks with citation metadata.
@@ -165,9 +166,21 @@ class SlackService(BaseRAGService):
             detail=detail,
         )
 
-    async def retrieve(self, query: str, top_k: int) -> list[SourceDocument]:
+    async def retrieve(
+        self, query: str, top_k: int, channels: list[str] | None = None
+    ) -> list[SourceDocument]:
         store = get_vectorstore(self.collection)
-        hits = store.similarity_search_with_score(query, k=top_k)
+        # filter inside the search, so all k slots go to the chosen channels;
+        # chunks store the channel with its '#', callers may or may not send it
+        where = (
+            {"channel": {"$in": [f"#{c.lstrip('#')}" for c in channels]}}
+            if channels else None
+        )
+        # embedding the query is a blocking round trip to Ollama; off the loop
+        # so concurrent chats interleave instead of queueing behind each other
+        hits = await asyncio.to_thread(
+            store.similarity_search_with_score, query, k=top_k, filter=where
+        )
 
         # drop chunks past the distance cutoff so an off-topic question reaches
         # the generator with no context and gets a clean "not in Slack" refusal

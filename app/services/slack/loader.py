@@ -270,7 +270,7 @@ def _fetch_live(
     if not channels:
         raise ValueError(
             "No matching Slack channels. Invite the bot to the channel "
-            "(/invite @<app>) and check SLACK_CHANNELS."
+            "(/invite @<app>) you want indexed."
         )
 
     out = []
@@ -297,7 +297,9 @@ async def load_threads(
     export_path: str | None = None,
 ) -> list[RawThread]:
     settings = get_settings()
-    wanted = channels or settings.slack_channels
+    # no list in config: naming no channels means every channel the bot has
+    # joined, resolved live -- inviting the bot is how a channel opts in
+    wanted = channels or []
     export_path = export_path or settings.slack_export_path
 
     team_url = ""

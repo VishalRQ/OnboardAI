@@ -60,7 +60,6 @@ class Settings(BaseSettings):
     slack_export_path: str | None = None
     #: channels to ingest, by name (without #) or id. Empty = every public
     #: channel the bot is a member of.
-    slack_channels: list[str] = Field(default_factory=list)
     #: seconds to wait between Slack API calls. New, non-Marketplace apps are
     #: throttled to ~1 conversations.history call/minute (2025 change) -- set
     #: this to 60 for such an app. 0 is fine for an older or approved app.
