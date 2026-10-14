@@ -7,19 +7,11 @@ from fastapi import APIRouter, HTTPException
 from app.core.logging import get_logger
 from app.schemas.chat import ChatRequest, ChatResponse, MultiChatRequest, SourceDocument
 from app.services.common.base import BaseRAGService, resolve_top_k
-from app.services.confluence import get_confluence_service
-from app.services.slack import get_slack_service
+from app.services.registry import get_services
 
 logger = get_logger(__name__)
 
 router = APIRouter(prefix="/chat", tags=["chat"])
-
-
-def _registry() -> dict[str, BaseRAGService]:
-    return {
-        "confluence": get_confluence_service(),
-        "slack": get_slack_service(),
-    }
 
 
 async def _retrieve(
@@ -60,13 +52,13 @@ def _interleave(results: list[list[SourceDocument]], limit: int) -> list[SourceD
 
 @router.get("/sources")
 async def list_sources() -> dict:
-    return {"sources": sorted(_registry())}
+    return {"sources": sorted(get_services())}
 
 
 @router.post("", response_model=ChatResponse)
 async def multi_chat(request: MultiChatRequest) -> ChatResponse:
     """Answer one question over every selected source at once."""
-    registry = _registry()
+    registry = get_services()
     names = request.sources or sorted(registry)
     unknown = [name for name in names if name not in registry]
     if unknown:
@@ -106,7 +98,7 @@ async def multi_chat(request: MultiChatRequest) -> ChatResponse:
 
 @router.post("/{source}", response_model=ChatResponse)
 async def chat(source: str, request: ChatRequest) -> ChatResponse:
-    service = _registry().get(source)
+    service = get_services().get(source)
     if service is None:
         raise HTTPException(status_code=404, detail=f"Unknown source: {source}")
     return await service.chat(request)

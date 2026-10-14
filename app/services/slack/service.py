@@ -6,6 +6,8 @@ the retrieval unit is a thread or a message window, and "has this changed?"
 is keyed on the newest message timestamp rather than a page version number.
 """
 
+import asyncio
+import threading
 from functools import lru_cache
 
 from app.core.config import get_settings
@@ -23,6 +25,10 @@ from app.services.common.vectorstore import (
 from app.services.slack.loader import RawThread, load_threads, now_iso
 
 logger = get_logger(__name__)
+
+
+class SlackIngestInProgress(RuntimeError):
+    """Another Slack ingest holds the lock. The second run exits, not waits."""
 
 
 class SlackService(BaseRAGService):
@@ -78,7 +84,26 @@ class SlackService(BaseRAGService):
             removed += delete_by_metadata(self.collection, {"doc_id": doc_id})
         return removed
 
+    #: one ingest at a time. Two runs would both delete-then-add the same
+    #: threads in one collection; the loser's half-written state is what the
+    #: next reader would see.
+    _ingest_lock = threading.Lock()
+
     async def ingest(self, request: IngestRequest) -> IngestResponse:
+        """Run the ingest off the event loop, refusing to overlap another.
+
+        The Slack client paces itself with time.sleep -- up to a minute between
+        calls on a new app -- so on the server's loop a run would stall every
+        other request, chat and health checks included, for its whole length.
+        """
+        if not self._ingest_lock.acquire(blocking=False):
+            raise SlackIngestInProgress("A Slack ingest is already running.")
+        try:
+            return await asyncio.to_thread(asyncio.run, self._ingest(request))
+        finally:
+            self._ingest_lock.release()
+
+    async def _ingest(self, request: IngestRequest) -> IngestResponse:
         opts = request.options
         requested = opts.get("channels") or None
         units = await load_threads(

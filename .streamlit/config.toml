@@ -1,0 +1,9 @@
+# One accent for pills, primary buttons and progress bars; Streamlit's default
+# red reads as an error state next to the sidebar's real error banners.
+# Set per mode rather than under [theme], which would pin the app to light and
+# stop it following the reader's system dark mode.
+[theme.light]
+primaryColor = "#4F46E5"
+
+[theme.dark]
+primaryColor = "#818CF8"

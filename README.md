@@ -1,122 +1,118 @@
 # OnboardAI
 
-RAG backend over internal onboarding knowledge. Each knowledge source
-(Confluence, Slack, ...) is its own service package behind a shared contract.
+Ask questions about your team's onboarding knowledge and get answers grounded
+in **Confluence** pages and **Slack** threads, with a link to every source.
 
-Current state: **Confluence works end to end** — live CQL ingestion, chunking,
-Ollama embeddings, Chroma retrieval and grounded answers, with incremental
-sync and deletion reconciliation. Slack is still a stub loader behind the same
-contract. A Streamlit UI (`streamlit_app.py`) drives the whole thing.
+- **Backend:** FastAPI (`app/`): ingestion, retrieval, answers
+- **UI:** Streamlit (`streamlit_app.py`)
+- **Models:** Ollama, local LLM + embeddings
+- **Index:** Chroma, stored in `data/`
 
-## Layout
+## Setup
 
+You need Python 3.11 and [Ollama](https://ollama.com).
+
+```bash
+python3.11 -m venv .venv
+source .venv/bin/activate
+pip install -r requirements.txt
+
+ollama pull llama3.2:1b
+ollama pull nomic-embed-text
+
+cp .env.example .env
 ```
-app/
-├── main.py                  FastAPI app, CORS, lifespan; mounts /api
-├── core/
-│   ├── config.py            Settings (pydantic-settings, reads .env)
-│   └── logging.py
-├── schemas/
-│   ├── chat.py              ChatRequest / ChatResponse / SourceDocument
-│   └── ingest.py            IngestRequest / IngestResponse
-├── api/routes/
-│   ├── __init__.py          aggregates every router
-│   ├── health.py
-│   ├── chat.py              source-agnostic: /api/chat/{source}
-│   ├── confluence.py
-│   └── slack.py
-└── services/
-    ├── llm_service.py       shared Ollama LLM + embeddings
-    ├── common/
-    │   ├── base.py          BaseRAGService — the per-service contract
-    │   ├── chunking.py      heading-aware splitting, shared by every source
-    │   └── vectorstore.py   Chroma (proto) / Qdrant (prod) factory
-    ├── confluence/
-    │   ├── client.py        Confluence Cloud REST (CQL, pagination, backoff)
-    │   ├── html_to_text.py  storage-format XHTML → markdown-ish text
-    │   ├── loader.py        spaces → pages → RawDocument
-    │   ├── sync_state.py    watermark + run lock for incremental sync
-    │   └── service.py
-    └── slack/
-        ├── loader.py        export reader now, slack-sdk sync later
-        └── service.py
-```
+
+Then fill in `.env`:
+
+| Setting                | What to put                              |
+| ---------------------- | ---------------------------------------- |
+| `CONFLUENCE_URL`       | `https://<your-site>.atlassian.net/wiki` |
+| `CONFLUENCE_USERNAME`  | the email you log in to Confluence with  |
+| `CONFLUENCE_API_TOKEN` | an Atlassian API token                   |
+| `SLACK_BOT_TOKEN`      | the bot token (`xoxb-…`)                 |
+
+Without credentials, each source falls back to built-in sample data, so you
+can try the app offline.
 
 ## Run
 
+Start each in its own terminal (skip `ollama serve` if the Ollama app is
+already running):
+
 ```bash
-source .venv/bin/activate
-pip install -r requirements.txt
-cp .env.example .env          # then fill in tokens
-uvicorn app.main:app --reload
+ollama serve
+uvicorn app.main:app --reload --reload-dir app
+streamlit run streamlit_app.py
 ```
 
-Docs at http://localhost:8000/docs
+- UI: http://localhost:8501
+- API docs: http://localhost:8000/docs
 
-## Endpoints
+## Using the app
 
-| Method | Path                      | Purpose                          |
-|--------|---------------------------|----------------------------------|
-| GET    | `/api/health`             | status + active config (incl. `top_k`) |
-| GET    | `/api/chat/sources`       | list registered services         |
-| POST   | `/api/chat`               | **fan-out**: one question, several sources |
-| POST   | `/api/chat/{source}`      | chat against any source by name  |
-| GET    | `/api/confluence/spaces`  | pickable spaces + indexed chunk counts |
-| GET    | `/api/confluence/status`  | what is indexed and when it last synced |
-| GET    | `/api/confluence/chunks`  | page through the index           |
-| POST   | `/api/confluence/ingest`  | index Confluence spaces          |
-| POST   | `/api/confluence/chat`    | chat over Confluence             |
-| POST   | `/api/slack/ingest`       | index Slack export / incremental |
-| POST   | `/api/slack/chat`         | chat over Slack                  |
+1. **Search in:** pick Confluence, Slack, or both. Optionally pick Confluence
+   spaces to search only those.
+2. **Update index:** tick the sources to refresh and press **Update**.
+   - Confluence updates the spaces you picked, or every space if none are
+     picked.
+   - Slack updates every channel the bot has been invited to
+     (`/invite @<bot>` in the channel). It is rate-limited and can take a
+     few minutes.
+   - Updates run in the background: keep chatting, and a popup says when
+     each source is done.
+   - Updates only fetch what changed. Tick **Full refresh** to re-index
+     everything.
+3. **Ask** in the chat box. Each answer lists its sources.
+
+## Useful settings
+
+All settings live in `.env`; see `.env.example` for the full list.
+
+| Setting                      | Default       | Effect                                                                     |
+| ---------------------------- | ------------- | -------------------------------------------------------------------------- |
+| `LLM_MODEL`                  | `llama3.2:1b` | answer model; `llama3.1` writes better answers but is slower               |
+| `TOP_K`                      | `4`           | chunks retrieved per source for each question                              |
+| `MAX_RETRIEVAL_DISTANCE`     | `0.7`         | relevance cutoff; raise it slightly if good questions get "could not find" |
+| `SLACK_MIN_REQUEST_INTERVAL` | `0`           | seconds between Slack calls; set `60` for a new Slack app                  |
+
+## API
+
+| Method | Path                             | Purpose                                 |
+| ------ | -------------------------------- | --------------------------------------- |
+| GET    | `/api/health`                    | backend and Ollama status               |
+| POST   | `/api/chat`                      | ask across several sources              |
+| POST   | `/api/{confluence,slack}/chat`   | ask one source                          |
+| POST   | `/api/{confluence,slack}/ingest` | update a source, waiting for the result |
+| POST   | `/api/jobs/ingest/{source}`      | start an update in the background       |
+| GET    | `/api/jobs`, `/api/jobs/{id}`    | background update status                |
+| GET    | `/api/confluence/spaces`         | spaces, with indexed chunk counts       |
+| GET    | `/api/confluence/status`         | what is indexed, last sync times        |
+| GET    | `/api/slack/channels`            | channels, with bot membership           |
+| GET    | `/api/{confluence,slack}/chunks` | browse the index                        |
 
 ```bash
-# one source, restricted to two spaces
-curl -X POST localhost:8000/api/confluence/chat \
-  -H 'content-type: application/json' \
-  -d '{"question":"How do I get laptop access?","space_keys":["ENG"]}'
-
-# every selected source at once
 curl -X POST localhost:8000/api/chat \
   -H 'content-type: application/json' \
-  -d '{"question":"How do I get laptop access?","sources":["confluence","slack"]}'
+  -d '{"question":"What is agentic AI?","sources":["confluence","slack"]}'
 ```
 
-Retrieval depth is `TOP_K` in `.env`, not a request field: it trades answer
-breadth against context budget and latency, so it is an operator setting. A
-request may still override it (`"top_k": 8`) for scripted evaluation.
+## Project layout
 
-## Ingestion
-
-`POST /api/confluence/ingest` is incremental by default. It asks Confluence
-only for pages modified since the last clean run (watermark in
-`data/confluence_sync_state.json`, minus a 15-minute overlap), skips any page
-whose version is already indexed, and about daily diffs the full page-id list
-to purge pages deleted at the source. `{"full_refresh": true}` re-reads
-everything. A run holds a lock file; a second concurrent run gets a `409`.
-
-## Adding a third service
-
-1. `app/services/<name>/` with `loader.py` + `service.py`; subclass
-   `BaseRAGService` and set `name` / `collection`.
-2. `app/api/routes/<name>.py` — copy `slack.py`, swap the dependency.
-3. Register the router in `app/api/routes/__init__.py` and add the service to
-   the registry in `app/api/routes/chat.py`.
-
-## UI
-
-```bash
-streamlit run streamlit_app.py     # alongside uvicorn
+```
+app/
+├── api/routes/     HTTP endpoints, one file per source + chat + health
+├── core/           settings (.env) and logging
+├── schemas/        request / response models
+└── services/
+    ├── common/     shared chunking, vector store, service contract
+    ├── confluence/ Confluence client, loader, incremental sync
+    ├── slack/      Slack client, loader, message grouping
+    └── llm_service.py
+streamlit_app.py    the UI
+tests/              unit tests (no network needed)
 ```
 
-It reads the same `.env` as the backend; point it at another host with
-`ONBOARDAI_API_URL`. Pick sources (Confluence, Slack, or both), narrow to
-specific Confluence spaces from a dropdown, and run ingestion. Answers cite one
-line per source document — name, space and link, no excerpt.
-
-## Next steps
-
-- Real Slack export parser (owned separately).
-- Qdrant backend behind the existing `get_vectorstore` seam.
-- Contextual Retrieval (context-augmented chunks, hybrid search, rank fusion)
-  in `common/` so both services get it.
-- launchd agent for the scheduled sync; Ragas eval harness.
+To add a new source, create `app/services/<name>/` subclassing
+`BaseRAGService`, add it to `app/services/registry.py`, and add a route file
+registered in `app/api/routes/__init__.py`.

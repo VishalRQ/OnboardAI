@@ -143,10 +143,6 @@ def has_credentials() -> bool:
     return bool(settings.confluence_url and settings.confluence_api_token)
 
 
-def configured_spaces() -> list[str]:
-    return list(get_settings().confluence_space_keys)
-
-
 #: (expires_at, spaces) for the live space list. The UI re-asks on every
 #: Streamlit rerun -- that is a widget click paginating a remote API -- and
 #: spaces are created about weekly, so a short TTL costs nothing in freshness.
@@ -182,11 +178,6 @@ def list_spaces() -> list[dict]:
         for space in ConfluenceClient().list_spaces()
         if space.get("key")
     ]
-    # a space listed in .env but invisible to the token is worth showing as a
-    # choice: ingesting it produces the "check the space KEY" warning, which
-    # says far more than the key silently missing from the dropdown
-    known = {space["key"] for space in spaces}
-    spaces.extend({"key": key, "name": ""} for key in configured_spaces() if key not in known)
     spaces = sorted(spaces, key=lambda space: space["key"])
     ttl = get_settings().confluence_space_cache_seconds
     _SPACE_CACHE = (time.monotonic() + ttl, spaces)
@@ -217,7 +208,7 @@ def load_pages(
     what makes the scheduled sync cheap.
     """
     settings = get_settings()
-    spaces = space_keys or settings.confluence_space_keys
+    spaces = space_keys or []
 
     if not has_credentials():
         # honour the space filter here too, or the picker looks broken offline
@@ -231,13 +222,17 @@ def load_pages(
         return selected
 
     if not spaces:
-        raise ValueError("CONFLUENCE_SPACE_KEYS is empty; nothing to load")
+        raise ValueError("No Confluence space keys given; nothing to load")
 
     client = ConfluenceClient()
     base_url = settings.confluence_url.rstrip("/")
     documents: list[RawDocument] = []
     for space_key in spaces:
         raw = client.search_pages(space_key, since=since)
+        if not raw and since:
+            # an empty delta is the normal case for a quiet space, not a typo
+            logger.info("Confluence: no pages changed in %s since %s", space_key, since)
+            continue
         if not raw:
             # Confluence answers 200 with an empty result set for a space key
             # that does not exist, so a typo is otherwise indistinguishable

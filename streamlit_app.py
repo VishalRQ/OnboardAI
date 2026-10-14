@@ -5,9 +5,13 @@ backend stays the single source of truth. Run the two side by side:
 
     uvicorn app.main:app --reload --reload-dir app
     streamlit run streamlit_app.py
+
+One page: the chat in the main pane; what to search, and the button that
+brings the index up to date, in the sidebar.
 """
 
 import os
+import time
 
 import requests
 import streamlit as st
@@ -20,13 +24,28 @@ load_dotenv()
 #: ONBOARDAI_API_URL in .env rather than exposing it as a field anyone can
 #: point at an arbitrary host.
 API_URL = os.getenv("ONBOARDAI_API_URL", "http://localhost:8000").rstrip("/")
-#: ingest walks every page and embeds it, so it needs a far longer leash
 CHAT_TIMEOUT = 300
-INGEST_TIMEOUT = 1800
-SLACK_INGEST_TIMEOUT = 7200
+#: how often the sidebar asks whether a background update has finished
+JOB_POLL_SECONDS = 3
 #: sources that can be searched together; the backend is the authority, this
 #: only decides the label and the order they appear in
 SOURCE_LABELS = {"confluence": "Confluence", "slack": "Slack"}
+#: per-source badge colour and icon, so a citation says where it came from at
+#: a glance instead of in a trailing word
+SOURCE_STYLE = {
+    "confluence": ("blue", ":material/menu_book:"),
+    "slack": ("violet", ":material/forum:"),
+}
+#: starter questions for an empty chat. A new hire does not know what the index
+#: holds; one click on a real question shows the shape of an answer.
+SUGGESTIONS = [
+    "How do I set up my dev environment?",
+    "How do I get access to the staging database?",
+    "What's the deploy process for a backend service?",
+    "Where are the API docs?",
+]
+USER_AVATAR = ":material/person:"
+ASSISTANT_AVATAR = ":material/explore:"
 
 st.set_page_config(page_title="OnboardAI", page_icon="🧭", layout="wide")
 
@@ -79,11 +98,6 @@ def fetch_spaces(base: str) -> list[dict]:
     return api_get(base, "/api/confluence/spaces")["spaces"]
 
 
-@st.cache_data(ttl=15, show_spinner=False)
-def fetch_status(base: str) -> dict:
-    return api_get(base, "/api/confluence/status")
-
-
 @st.cache_data(ttl=300, show_spinner=False)
 def fetch_channels(base: str) -> list[dict]:
     """Channels the bot can read, with indexed counts.
@@ -95,19 +109,34 @@ def fetch_channels(base: str) -> list[dict]:
     return api_get(base, "/api/slack/channels")["channels"]
 
 
-@st.cache_data(ttl=15, show_spinner=False)
-def fetch_slack_total(base: str) -> int:
-    """How many Slack chunks are indexed.
-
-    Slack has no `/status` of its own, so ask the chunk pager for the total and
-    throw the page away -- limit=1 keeps it from shipping the whole index back.
-    """
-    return api_get(base, "/api/slack/chunks?limit=1").get("total", 0)
+def clear_index_caches() -> None:
+    """The index changed, so every cached count is stale as of now."""
+    fetch_spaces.clear()
+    fetch_channels.clear()
 
 
 def technical_detail(text: str) -> None:
     with st.expander("Technical detail"):
         st.code(text, language=None)
+
+
+def label(source: str) -> str:
+    return SOURCE_LABELS.get(source, source.title())
+
+
+def badge(source: str) -> str:
+    color, icon = SOURCE_STYLE.get(source, ("gray", ":material/description:"))
+    return f":{color}-badge[{icon} {label(source)}]"
+
+
+def link_text(text: str, limit: int = 80) -> str:
+    """Make a document name safe to sit inside a markdown link.
+
+    A Slack title is the thread's first line, verbatim: backticks start a code
+    span that swallows the link, and brackets end the link text early.
+    """
+    text = " ".join(text.replace("`", "").replace("[", "(").replace("]", ")").split())
+    return text if len(text) <= limit else text[: limit - 1].rstrip() + "…"
 
 
 def render_citations(docs: list[dict]) -> None:
@@ -140,8 +169,11 @@ def render_citations(docs: list[dict]) -> None:
             {
                 "name": name,
                 "url": meta.get("url", ""),
+                "source": meta.get("source", ""),
+                # a Confluence page lives in a space; a Slack thread is placed
+                # by its date, since the channel is already in the name
                 "where": meta.get("space_name") or meta.get("space_key")
-                or meta.get("source", ""),
+                or (meta.get("created_at") or "")[:10],
                 "markers": [],
             },
         )
@@ -150,17 +182,182 @@ def render_citations(docs: list[dict]) -> None:
     lines = []
     for entry in grouped.values():
         markers = ", ".join(str(m) for m in entry["markers"])
-        label = f"[{entry['name']}]({entry['url']})" if entry["url"] else f"**{entry['name']}**"
-        suffix = f" · {entry['where']}" if entry["where"] else ""
-        lines.append(f"\\[{markers}\\] {label}{suffix}")
-    st.caption("Sources")
-    st.markdown("  \n".join(lines))
+        name = link_text(entry["name"])
+        link = f"[{name}]({entry['url']})" if entry["url"] else f"**{name}**"
+        suffix = f" · :gray[{entry['where']}]" if entry["where"] else ""
+        lines.append(f"{badge(entry['source'])} \\[{markers}\\] {link}{suffix}")
+
+    with st.container(border=True):
+        st.caption(f"Sources · {len(grouped)}")
+        st.markdown("  \n".join(lines))
 
 
-# --- sidebar: connection, sources, ingestion ------------------------------
+def render_answer_extras(message: dict) -> None:
+    """Everything under an answer. Stored on the message, not drawn once.
+
+    The chat reruns as soon as a turn finishes so the history loop owns all
+    rendering -- anything drawn only during the turn (a failure's detail, the
+    "nothing to cite" note) vanished on that rerun before anyone could read it.
+    """
+    failure = message.get("failure")
+    if failure:
+        technical_detail(failure)
+    docs = message.get("sources", [])
+    if docs:
+        render_citations(docs)
+    elif not failure:
+        st.caption("No excerpt was close enough to the question to cite.")
+    facts = []
+    if message.get("elapsed") is not None:
+        facts.append(f":material/schedule: {message['elapsed']:.1f}s")
+    if message.get("searched"):
+        facts.append("searched " + ", ".join(label(s) for s in message["searched"]))
+    if facts:
+        st.caption(" · ".join(facts))
+
+
+def space_name(space: dict) -> str:
+    """How a reader knows a space: its name, falling back to its key.
+
+    A personal space is keyed by the owner's account id (~7120...), forty
+    characters that identify nothing and push every other column off screen.
+    """
+    key, name = space["key"], space.get("name")
+    if key.startswith("~"):
+        return name or "Personal space"
+    return f"{key} — {name}" if name and name != key else key
+
+
+# --- background updates -----------------------------------------------------
+# Update starts one backend job per source and returns at once, so the chat
+# stays usable while Slack crawls through its rate limit. A fragment polls the
+# jobs every few seconds and pops a toast as each finishes.
+
+def notify(text: str, icon: str, sticky: bool = False) -> None:
+    """Queue a toast for the next full run.
+
+    Queued, not shown: a toast raised just before st.rerun() is lost with the
+    rerun. `sticky` ones -- failures and warnings worth acting on -- also stay
+    in the sidebar until the next Update, since a toast is gone in seconds.
+    """
+    st.session_state.setdefault("toasts", []).append((text, icon))
+    if sticky:
+        st.session_state.setdefault("update_notes", []).append((text, icon))
+
+
+def job_summary(job: dict) -> tuple[str, str, bool]:
+    """A finished job as (message, icon, sticky)."""
+    name = label(job["source"])
+    if job["status"] == "failed":
+        return (
+            f"{name} update failed — {job.get('error') or 'unknown error'}",
+            ":material/error:", True,
+        )
+    result = job.get("result") or {}
+    ingested = result.get("documents_ingested", 0)
+    skipped = result.get("documents_skipped", 0)
+    # nothing seen at all over a full window means the query matched nothing
+    # anywhere -- for Confluence almost always a mistyped space key -- which
+    # is not the same as "nothing changed"
+    if not ingested and not skipped and "since=beginning" in (result.get("detail") or ""):
+        hint = " Check the space key." if job["source"] == "confluence" else ""
+        return f"{name}: nothing found to index.{hint}", ":material/warning:", True
+    if ingested:
+        text = f"{name} updated — {ingested} docs, {result.get('chunks_indexed', 0)} chunks"
+    else:
+        text = f"{name} is already up to date"
+    purged = result.get("documents_purged", 0)
+    if purged:
+        text += f", {purged} deleted at the source removed"
+    return text, ":material/check_circle:", False
+
+
+def watch(job: dict) -> None:
+    st.session_state.setdefault("watched_jobs", {})[job["id"]] = job["source"]
+
+
+def start_updates(plan: dict[str, dict], full_refresh: bool) -> None:
+    """Start a background job per planned source, then return at once."""
+    st.session_state.update_notes = []
+    for source, options in plan.items():
+        try:
+            watch(api_post(
+                API_URL,
+                f"/api/jobs/ingest/{source}",
+                {"full_refresh": full_refresh, "options": options},
+                timeout=30,
+            ))
+        except requests.HTTPError as exc:
+            if exc.response is not None and exc.response.status_code == 409:
+                # started elsewhere -- another tab, another person; the watcher
+                # adopts running jobs, so this one still reports back here
+                notify(f"{label(source)} is already updating.", ":material/sync:")
+            else:
+                notify(f"{label(source)} update failed — {error_detail(exc)}",
+                       ":material/error:", sticky=True)
+        except requests.RequestException as exc:
+            notify(f"{label(source)} update failed — {error_detail(exc)}",
+                   ":material/error:", sticky=True)
+    st.rerun()
+
+
+def adopt_running_jobs() -> None:
+    """Follow every update the backend is running, not only this tab's.
+
+    After a page reload, or when someone else pressed Update, the job is still
+    worth reporting -- and an Update click for it would only get a 409.
+    """
+    try:
+        for job in api_get(API_URL, "/api/jobs?status=running", timeout=5)["jobs"]:
+            watch(job)
+    except requests.RequestException:
+        pass  # the watcher is a nicety; never block the sidebar on it
+
+
+@st.fragment(run_every=JOB_POLL_SECONDS)
+def job_watcher() -> None:
+    """Poll the watched jobs; on any finishing, toast it and rerun the app.
+
+    Only rendered while something is watched, so polling stops by itself once
+    the last job reports back.
+    """
+    watched: dict = st.session_state.get("watched_jobs", {})
+    finished = []
+    for job_id, source in list(watched.items()):
+        try:
+            job = api_get(API_URL, f"/api/jobs/{job_id}", timeout=5)
+        except requests.HTTPError as exc:
+            if exc.response is not None and exc.response.status_code == 404:
+                # jobs live in the backend's memory; a restart loses them
+                finished.append(job_id)
+                notify(f"{label(source)} update was interrupted by a backend "
+                       "restart. Press Update again.", ":material/error:", sticky=True)
+            continue
+        except requests.RequestException:
+            continue  # backend briefly unreachable; try again next tick
+        if job["status"] == "running":
+            st.caption(f":material/progress_activity: Updating {label(source)} in the background...")
+        else:
+            finished.append(job_id)
+            notify(*job_summary(job))
+    if finished:
+        for job_id in finished:
+            watched.pop(job_id, None)
+        # the index changed: fresh chunk counts in the pickers, and the toasts
+        clear_index_caches()
+        st.rerun()
+
+
+for text, icon in st.session_state.pop("toasts", []):
+    st.toast(text, icon=icon, duration="long")
+
+
+# --- sidebar: connection and what to search -------------------------------
+# Lives in the entrypoint, not a page, so the choices survive page switches.
 
 with st.sidebar:
-    st.title("OnboardAI")
+    st.title("🧭 OnboardAI")
+    st.caption("Answers from your team's docs and conversations.")
 
     # Two separate failures, two separate messages: the API can be perfectly
     # healthy while Ollama -- which every chat and ingest call needs -- is down.
@@ -170,7 +367,11 @@ with st.sidebar:
         ollama = health.get("ollama", {})
         online = health.get("status") == "ok"
         if online:
-            st.success(f"Connected · {health['llm_model']}")
+            st.badge(
+                f"Connected · {health['llm_model']}",
+                icon=":material/check_circle:",
+                color="green",
+            )
         elif not ollama.get("reachable", False):
             st.error("Ollama is not running")
             st.markdown(
@@ -192,13 +393,6 @@ with st.sidebar:
         # it available for debugging, but never as the user-facing message
         if not online and ollama.get("detail"):
             technical_detail(ollama["detail"])
-        # top_k is a server setting (TOP_K in .env), shown here rather than
-        # offered as a control: it trades context budget against breadth, which
-        # is an operator decision, not a per-question one
-        st.caption(
-            f"vector backend: {health['vector_backend']} · "
-            f"top_k: {health.get('top_k', '?')}"
-        )
     except requests.RequestException as exc:
         st.error("Backend not reachable")
         st.markdown(
@@ -215,21 +409,23 @@ with st.sidebar:
         except requests.RequestException as exc:
             st.warning(f"Could not list sources: {error_detail(exc)}")
 
-    selected_sources = st.multiselect(
-        "Sources",
-        available or ["confluence"],
-        default=available or ["confluence"],
-        format_func=lambda s: SOURCE_LABELS.get(s, s.title()),
+    selected_sources = st.pills(
+        "Search in",
+        available or list(SOURCE_LABELS),
+        selection_mode="multi",
+        default=available or None,
+        format_func=lambda s: f"{SOURCE_STYLE.get(s, ('', ''))[1]} {label(s)}",
         disabled=not available,
+        key="selected_sources",
         help="Every selected source is searched; the answer cites all of them.",
-    )
+    ) or []
 
     # --- spaces ----------------------------------------------------------
     # Confluence organises a project's pages into spaces. Picking them from a
     # list beats typing keys: the key is a short code (/wiki/spaces/<KEY>/)
     # that is easy to get wrong, and a wrong one fails silently as "no pages".
     spaces = []
-    if online and "confluence" in selected_sources:
+    if online and "confluence" in available:
         try:
             spaces = fetch_spaces(API_URL)
         except requests.RequestException as exc:
@@ -239,244 +435,152 @@ with st.sidebar:
         space = next((s for s in spaces if s["key"] == key), {})
         name = space.get("name")
         indexed = space.get("indexed_chunks", 0)
-        return f"{key}{f' — {name}' if name else ''}" + (
+        return f"{space_name(space or {'key': key})}" + (
             f" ({indexed} chunks)" if indexed else " (not indexed)"
         )
 
     space_keys = []
-    if spaces:
-        space_keys = st.multiselect(
-            "Confluence spaces",
-            [s["key"] for s in spaces],
-            format_func=space_label,
-            help="Blank searches every indexed space.",
+    if "confluence" in selected_sources:
+        if spaces:
+            space_keys = st.multiselect(
+                "Confluence spaces",
+                [s["key"] for s in spaces],
+                format_func=space_label,
+                placeholder="All indexed spaces",
+                key="space_keys",
+                help="Blank searches every indexed space.",
+            )
+        elif online:
+            st.caption("No Confluence spaces visible yet — run an ingest.")
+
+    # --- update ------------------------------------------------------------
+    # Which sources to re-index is its own choice, not "Search in": a reader
+    # may search both while only Confluence needs refreshing, and Slack costs
+    # minutes of rate-limited calls. Scope per source: the Confluence spaces
+    # picked above (blank = every space in Confluence), and every Slack
+    # channel the bot has joined. Membership is the Slack allowlist --
+    # inviting the bot is how a channel opts in, and conversations.history
+    # fails on any channel it is not in.
+    if online and available:
+        st.divider()
+        st.caption("Update index")
+        with st.container(horizontal=True):
+            update_sources = [
+                source for source in available
+                if st.checkbox(
+                    label(source),
+                    # Slack is opt-in per run: it is the slow one
+                    value=source != "slack",
+                    key=f"update_{source}",
+                    help="Rate-limited: can take several minutes."
+                    if source == "slack" else None,
+                )
+            ]
+
+        plan: dict[str, dict] = {}
+        scope: list[str] = []
+        if "confluence" in update_sources:
+            # the space picker only exists while Confluence is searched; when
+            # it is hidden there is no narrowing, so the update covers all
+            picked = space_keys if "confluence" in selected_sources else []
+            plan["confluence"] = {"space_keys": picked} if picked else {}
+            scope.append(
+                f"Confluence: {', '.join(picked)}" if picked else "Confluence: all spaces"
+            )
+        if "slack" in update_sources:
+            try:
+                joined = [
+                    c["name"] for c in fetch_channels(API_URL)
+                    if c.get("id") and c.get("is_member")
+                ]
+            except requests.RequestException as exc:
+                joined = []
+                st.warning(f"Could not list Slack channels: {error_detail(exc)}")
+            if joined:
+                plan["slack"] = {"channels": joined}
+                scope.append("Slack: " + ", ".join(f"#{name}" for name in joined))
+            else:
+                scope.append("Slack: the bot is in no channel; `/invite` it to one")
+        if scope:
+            st.caption(" · ".join(scope))
+
+        full_refresh = st.checkbox(
+            "Full refresh",
+            help="Re-index everything and drop what was deleted at the source. "
+                 "Otherwise only what changed since the last update is fetched.",
         )
-    elif "confluence" in selected_sources and online:
-        st.caption("No Confluence spaces visible yet — run an ingest.")
+        if st.button(
+            "Update",
+            icon=":material/sync:",
+            width="stretch",
+            disabled=not plan,
+            help="Runs in the background: keep chatting, and a popup says when "
+                 "each source is done.",
+        ):
+            start_updates(plan, full_refresh)
+        adopt_running_jobs()
+        if st.session_state.get("watched_jobs"):
+            job_watcher()
+        for text, icon in st.session_state.get("update_notes", []):
+            (st.error if icon == ":material/error:" else st.warning)(text, icon=icon)
 
     st.divider()
-    st.subheader("Ingestion")
-    full_refresh = st.checkbox(
-        "Full refresh",
-        help="Re-index everything. Otherwise only documents changed since the "
-             "last sync are fetched, and unchanged ones are skipped.",
-    )
-
-    # Each source is scoped by something different -- Confluence by space,
-    # Slack by channel -- so each gets its own control, shown only when that
-    # source is selected. One shared box would mean two different things
-    # depending on what happened to be ticked.
-    ingest_spaces = []
-    if "confluence" in selected_sources:
-        ingest_spaces = st.multiselect(
-            "Spaces to ingest",
-            [s["key"] for s in spaces],
-            default=space_keys,
-            format_func=space_label,
-            disabled=not spaces,
-            help="Blank uses CONFLUENCE_SPACE_KEYS from .env.",
-        )
-
-    # Same reasoning as the space picker: a typed channel name the bot cannot
-    # see fails the whole ingest with "No matching Slack channels", so offer
-    # only channels that actually exist and are readable.
-    slack_channels: list[str] = []
-    if "slack" in selected_sources:
-        st.caption(
-            "Slack ingest is rate-limited by the workspace app, so it can take "
-            "many minutes. Leave this tab open until it reports back."
-        )
-        channels = []
-        try:
-            channels = fetch_channels(API_URL)
-        except requests.RequestException as exc:
-            st.warning(f"Could not list Slack channels: {error_detail(exc)}")
-
-        def channel_label(name: str) -> str:
-            ch = next((c for c in channels if c["name"] == name), {})
-            indexed = ch.get("indexed_chunks", 0)
-            private = " \N{LOCK}" if ch.get("is_private") else ""
-            return f"#{name}{private}" + (
-                f" ({indexed} chunks)" if indexed else " (not indexed)"
-            )
-
-        # Only channels the bot has joined can be read: conversations.history
-        # on any other fails with not_in_channel and takes the whole ingest
-        # down with it. A channel with no id is one the index still holds but
-        # Slack will not serve -- left, renamed, or leftover fixture data.
-        # Neither belongs in a picker that drives an ingest.
-        readable = [c for c in channels if c.get("id") and c.get("is_member")]
-        uninvited = [c for c in channels if c.get("id") and not c.get("is_member")]
-        orphans = [c for c in channels if not c.get("id")]
-
-        if readable:
-            slack_channels = st.multiselect(
-                "Slack channels",
-                [c["name"] for c in readable],
-                format_func=channel_label,
-                help="Blank uses SLACK_CHANNELS from .env. Only channels the "
-                     "bot has been invited to can be read.",
-            )
-        elif channels:
-            st.caption(
-                "No readable Slack channels. Invite the bot with "
-                "`/invite @<app>` in the channel you want indexed."
-            )
-
-        if uninvited:
-            st.caption(
-                "Bot not in: "
-                + ", ".join(f"#{c['name']}" for c in uninvited)
-                + ". Run `/invite @OnboardIQ` in the channel to index it."
-            )
-
-        if orphans:
-            st.caption(
-                "Indexed but no longer readable: "
-                + ", ".join(f"#{c['name']}" for c in orphans)
-                + ". Run a full refresh with no channels selected to clear them."
-            )
-
-    def ingest_options(source: str) -> dict:
-        """Per-source `options` for the ingest body."""
-        if source == "confluence":
-            return {"space_keys": ingest_spaces} if ingest_spaces else {}
-        return {"channels": slack_channels} if slack_channels else {}
-
-    def skip_reason(source: str) -> str | None:
-        """Why this source is not worth a call, or None to go ahead.
-
-        An empty Slack picker is not "ingest the .env default": Slack is
-        throttled to about one API call a minute, so falling back to whatever
-        SLACK_CHANNELS happens to hold can spend many minutes on channels
-        nobody asked for. Confluence keeps the blank-means-.env default --
-        it is a handful of fast calls and the fallback is the documented way
-        to run it unattended.
-        """
-        if source == "slack" and not slack_channels:
-            return "no channels selected"
-        return None
-
-    def report_ingest(source: str, result: dict) -> None:
-        """Turn one IngestResponse into the shortest true sentence about it."""
-        detail = result.get("detail") or ""
-        ingested = result["documents_ingested"]
-        skipped = result.get("documents_skipped", 0)
-        label = SOURCE_LABELS.get(source, source.title())
-        # nothing seen at all on a full window means the query matched nothing
-        # anywhere -- for Confluence that is almost always a mistyped space
-        # key, and it is distinguishable from "nothing changed", which skips
-        if not ingested and not skipped and "since=beginning" in detail:
-            if source == "confluence":
-                st.warning(
-                    "No pages found. Check the space **key** -- the short "
-                    "code in /wiki/spaces/<KEY>/, not the display name."
-                )
-            else:
-                st.warning(f"{label}: nothing found to index.")
-        elif not ingested:
-            # the count is only worth printing when the source reports one;
-            # not every service populates documents_skipped
-            st.info(
-                f"{label} already up to date"
-                + (f" — {skipped} unchanged." if skipped else ".")
-            )
-        else:
-            st.success(
-                f"{label}: {ingested} docs, {result['chunks_indexed']} chunks"
-                + (f" · {skipped} unchanged" if skipped else "")
-            )
-        purged = result.get("documents_purged", 0)
-        if purged:
-            st.caption(f"Purged {purged} document(s) deleted in {label}.")
-        st.caption(detail)
-
     if st.button(
-        "Run ingest",
-        disabled=not online or not selected_sources,
-        use_container_width=True,
-        help="Ingests every selected source.",
+        "New chat",
+        icon=":material/add_comment:",
+        width="stretch",
+        disabled=not st.session_state.get("messages"),
     ):
-        for source in selected_sources:
-            skipped_because = skip_reason(source)
-            if skipped_because:
-                st.info(
-                    f"{SOURCE_LABELS.get(source, source.title())} skipped "
-                    f"— {skipped_because}."
-                )
-                continue
-            with st.spinner(
-                f"Ingesting {SOURCE_LABELS.get(source, source)} -- this embeds "
-                "every chunk and can take a while..."
-            ):
-                try:
-                    report_ingest(
-                        source,
-                        api_post(
-                            API_URL,
-                            f"/api/{source}/ingest",
-                            {"full_refresh": full_refresh, "options": ingest_options(source)},
-                            SLACK_INGEST_TIMEOUT if source == "slack" else INGEST_TIMEOUT,
-                        ),
-                    )
-                except requests.RequestException as exc:
-                    # one source failing should not skip the rest
-                    st.error(f"{source} ingest failed — {error_detail(exc)}")
-                    technical_detail(str(exc))
-        # the index changed, so every cached count is stale as of now
-        fetch_spaces.clear()
-        fetch_status.clear()
-        fetch_slack_total.clear()
-        fetch_channels.clear()
-
-    if online and "confluence" in selected_sources:
-        try:
-            status = fetch_status(API_URL)
-            synced = status.get("last_synced_at") or "never"
-            st.caption(
-                f"Confluence: {status['pages']} pages / {status['chunks']} chunks · "
-                f"last sync: {synced}"
-            )
-        except requests.RequestException:
-            pass  # the index summary is a nicety; never block the UI on it
-
-    if online and "slack" in selected_sources:
-        try:
-            total = fetch_slack_total(API_URL)
-            st.caption(
-                f"Slack: {total} chunks" if total
-                else "Slack: nothing indexed yet — run an ingest."
-            )
-        except requests.RequestException:
-            pass
-
-    if st.button("Clear chat", use_container_width=True):
         st.session_state.messages = []
         st.rerun()
 
 
-# --- main pane: chat ------------------------------------------------------
+# --- chat -------------------------------------------------------------------
 
-st.session_state.setdefault("messages", [])
+def welcome(can_ask: bool) -> None:
+    st.caption("Try one of these")
+    with st.container(horizontal=True):
+        for suggestion in SUGGESTIONS:
+            # a click queues the question and reruns, so the welcome panel is
+            # gone by the time the answer is drawn
+            if st.button(suggestion, icon=":material/arrow_outward:", disabled=not can_ask):
+                st.session_state.pending_question = suggestion
+                st.rerun()
 
-for message in st.session_state.messages:
-    with st.chat_message(message["role"]):
-        st.markdown(message["content"])
-        render_citations(message.get("sources", []))
 
-question = st.chat_input(
-    "Ask about onboarding...", disabled=not online or not selected_sources
-)
-if not selected_sources and online:
-    st.info("Select at least one source in the sidebar to ask a question.")
+def ask_page() -> None:
+    st.session_state.setdefault("messages", [])
+    messages = st.session_state.messages
+    can_ask = online and bool(selected_sources)
+    pending = st.session_state.pop("pending_question", None)
 
-if question:
-    st.session_state.messages.append({"role": "user", "content": question})
-    with st.chat_message("user"):
+    if not messages and not pending:
+        welcome(can_ask)
+
+    for message in messages:
+        avatar = USER_AVATAR if message["role"] == "user" else ASSISTANT_AVATAR
+        with st.chat_message(message["role"], avatar=avatar):
+            st.markdown(message["content"])
+            if message["role"] == "assistant":
+                render_answer_extras(message)
+
+    question = st.chat_input(
+        "Ask about onboarding..." if can_ask else "Select a source to ask a question",
+        disabled=not can_ask,
+    ) or pending
+    if online and not selected_sources:
+        st.info("Select at least one source in the sidebar to ask a question.")
+
+    if not question:
+        return
+
+    messages.append({"role": "user", "content": question})
+    with st.chat_message("user", avatar=USER_AVATAR):
         st.markdown(question)
 
-    with st.chat_message("assistant"):
-        with st.spinner("Thinking..."):
+    with st.chat_message("assistant", avatar=ASSISTANT_AVATAR):
+        started = time.monotonic()
+        with st.spinner(f"Searching {', '.join(label(s) for s in selected_sources)}..."):
             try:
                 # one fan-out call: the backend queries every selected source
                 # and fuses the hits, so top_k stays a server-side budget
@@ -490,22 +594,24 @@ if question:
                     },
                     CHAT_TIMEOUT,
                 )
-                answer, docs = result["answer"], result.get("sources", [])
-                failure = ""
+                turn = {
+                    "content": result["answer"],
+                    "sources": result.get("sources", []),
+                    # the sources that actually answered; a failed one is
+                    # dropped here and named in a note on the answer itself
+                    "searched": [s for s in result.get("source", "").split(", ") if s],
+                }
             except requests.RequestException as exc:
-                answer, docs, failure = (
-                    "Sorry -- I could not reach the backend to answer that.",
-                    [],
-                    error_detail(exc),
-                )
-        st.markdown(answer)
-        if failure:
-            technical_detail(failure)
-        elif not docs:
-            st.caption("No excerpt was close enough to the question to cite.")
+                turn = {
+                    "content": "Sorry -- I could not reach the backend to answer that.",
+                    "failure": error_detail(exc),
+                }
 
-    st.session_state.messages.append(
-        {"role": "assistant", "content": answer, "sources": docs}
+    messages.append(
+        {"role": "assistant", "elapsed": time.monotonic() - started, **turn}
     )
     # rerun so the history loop above renders this turn's citations
     st.rerun()
+
+
+ask_page()

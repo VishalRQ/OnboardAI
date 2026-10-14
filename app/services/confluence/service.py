@@ -19,8 +19,6 @@ from app.services.common.vectorstore import (
 )
 from app.services.confluence.loader import (
     RawDocument,
-    configured_spaces,
-    has_credentials,
     invalidate_space_cache,
     list_spaces,
     load_page_ids,
@@ -86,14 +84,23 @@ class ConfluenceService(BaseRAGService):
         return len(stale)
 
     def _resolve_spaces(self, request: IngestRequest) -> list[str]:
-        """Spaces this run covers: the request's, else .env, else the fixtures."""
-        space_keys = request.options.get("space_keys") or configured_spaces()
+        """Spaces this run covers: the request's, else every space there is.
+
+        "Every space" is asked of Confluence at run time rather than kept in
+        config, so a team space created tomorrow is ingested without anyone
+        editing .env. Personal spaces are left out, as in the picker. In
+        fixture mode the fixtures define what there is.
+        """
+        space_keys = request.options.get("space_keys")
         if space_keys:
             return list(space_keys)
-        if has_credentials():
-            raise ValueError("CONFLUENCE_SPACE_KEYS is empty; nothing to load")
-        # fixture mode: the fixtures themselves define what there is to ingest
-        return [space["key"] for space in list_spaces()]
+        # fresh, not the picker's cached list: a space created since the last
+        # listing is exactly what an all-spaces run should not miss
+        invalidate_space_cache()
+        space_keys = [space["key"] for space in list_spaces()]
+        if not space_keys:
+            raise ValueError("No Confluence spaces are visible to this account")
+        return space_keys
 
     def _index_space(self, space_key, since, store, ingested_at, indexed_versions, full):
         """Fetch and index one space. Returns (pages_seen, indexed, skipped, chunks)."""
@@ -167,6 +174,14 @@ class ConfluenceService(BaseRAGService):
                         reconciled = False  # fixture mode: nothing authoritative to diff
                     else:
                         purged += self._purge_deleted(space_key, live_ids, indexed_spaces)
+
+                # Nothing at all over a full window is almost always a mistyped
+                # key: Confluence answers 200 with an empty result for a space
+                # that does not exist. A watermark would mark it synced, and
+                # every page of a space later created under that key would
+                # predate the next delta window and never be indexed.
+                if since is None and counts[0] == 0:
+                    continue
 
                 # only a clean pass advances a watermark -- a failure raises out
                 # of here and leaves this space's window for the next attempt,
@@ -247,7 +262,8 @@ class ConfluenceService(BaseRAGService):
         indexed = group_by(self.collection, "space_key")
         available = list_spaces()
         known = {space["key"] for space in available}
-        # a space that was ingested and later dropped from .env is still
+        # an indexed space Confluence no longer lists (a personal space
+        # ingested by key, or one deleted or hidden since) is still
         # answerable, so it belongs in the picker
         available += [{"key": key, "name": ""} for key in indexed if key not in known]
         return [

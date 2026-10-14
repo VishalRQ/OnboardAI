@@ -38,7 +38,6 @@ class Settings(BaseSettings):
     confluence_url: str | None = None
     confluence_username: str | None = None
     confluence_api_token: str | None = None
-    confluence_space_keys: list[str] = Field(default_factory=list)
     #: where the incremental-sync watermark lives
     confluence_sync_state_path: str = "./data/confluence_sync_state.json"
     #: re-query this far back from the watermark to absorb clock skew and

@@ -7,6 +7,7 @@ from app.services.slack import SlackService, get_slack_service
 from slack_sdk.errors import SlackApiError
 
 from app.services.slack.client import SlackAuthError
+from app.services.slack.service import SlackIngestInProgress
 
 router = APIRouter(prefix="/slack", tags=["slack"])
 
@@ -43,6 +44,8 @@ async def ingest(
     """
     try:
         return await service.ingest(request)
+    except SlackIngestInProgress as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
     except SlackAuthError as exc:
         # bad token or a missing OAuth scope: the workspace refused us, and
         # nothing the reader retries will change that until the app is fixed
